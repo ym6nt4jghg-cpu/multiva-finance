@@ -1,0 +1,52 @@
+import {test} from 'node:test';import assert from 'node:assert/strict';import {readFileSync} from 'node:fs';import {PGlite} from '@electric-sql/pglite';
+const A='10000000-0000-4000-8000-000000000001',B='10000000-0000-4000-8000-000000000002';
+const sql=readFileSync(new URL('../supabase/migrations/20261026231517_finance_foundation.sql',import.meta.url),'utf8');
+async function database(){const db=new PGlite();await db.exec(`create role anon;create role authenticated;create role service_role bypassrls;create schema auth;create table auth.users(id uuid primary key,raw_user_meta_data jsonb default '{}');create function auth.uid() returns uuid language sql stable as $$select nullif(current_setting('request.jwt.claim.sub',true),'')::uuid$$;grant usage on schema auth to authenticated,service_role;grant execute on function auth.uid() to authenticated,service_role;`);await db.exec(sql);await db.query('insert into auth.users(id) values($1),($2)',[A,B]);return db;}
+async function asUser(db,id){await db.exec('reset role');await db.query("select set_config('request.jwt.claim.sub',$1,false)",[id]);await db.exec('set role authenticated');}
+test('migration, ownership, atomic operations, audit and quota in actual PostgreSQL',async()=>{const db=await database();try{
+ await asUser(db,A);let a=(await db.query('select id from public.financial_accounts')).rows[0].id;assert.equal((await db.query('select * from public.financial_accounts')).rows.length,1);
+ await db.query("insert into public.financial_transactions(user_id,account_id,description,amount_cents,kind,category,date,idempotency_key) values($1,$2,'Almoço',3500,'expense','Alimentação','2026-10-20',$3)",[A,a,crypto.randomUUID()]);
+ const tx=(await db.query('select id from public.financial_transactions')).rows[0].id;
+ await asUser(db,B);const b=(await db.query('select id from public.financial_accounts')).rows[0].id;
+ assert.equal((await db.query('select * from public.financial_transactions')).rows.length,0);
+ await assert.rejects(db.query("insert into public.financial_transactions(user_id,account_id,description,amount_cents,kind,category,date,idempotency_key) values($1,$2,'Intrusão',1,'expense','Outros','2026-10-20',$3)",[B,a,crypto.randomUUID()]));
+ assert.equal((await db.query('update public.financial_transactions set amount_cents=1 where id=$1 returning id',[tx])).rows.length,0);
+ await assert.rejects(db.query("select public.transfer_funds($1,$2,100,'2026-10-20',$3)",[b,a,crypto.randomUUID()]));
+ await assert.rejects(db.query('select public.admin_metrics()'));
+ await assert.rejects(db.query("insert into public.subscriptions(user_id,plan_id,status) values($1,'premium','active')",[B]));
+ await asUser(db,A);
+ const a2=(await db.query("insert into public.financial_accounts(user_id,name,type) values($1,'Carteira','cash') returning id",[A])).rows[0].id;
+ const transferKey=crypto.randomUUID();for(let i=0;i<2;i++)await db.query("select public.transfer_funds($1,$2,5000,'2026-10-20',$3)",[a,a2,transferKey]);assert.equal((await db.query('select * from public.account_transfers')).rows.length,1);
+ const card=(await db.query("insert into public.credit_cards(user_id,name,limit_cents,closing_day,due_day) values($1,'Pessoal',100000,20,28) returning id",[A])).rows[0].id;
+ const key=crypto.randomUUID();for(let i=0;i<2;i++)await db.query("select public.record_card_purchase($1,'Tênis',10000,3,'2026-10-10','Compras',$2)",[card,key]);
+ const rows=(await db.query('select amount_cents,date from public.financial_transactions where card_id=$1 order by date',[card])).rows;assert.equal(rows.length,3);assert.equal(rows.reduce((s,r)=>s+Number(r.amount_cents),0),10000);assert.equal(Number(rows[0].amount_cents),3334);
+ const paymentKey=crypto.randomUUID();for(let i=0;i<2;i++)await db.query("select public.pay_statement($1,'2026-10-01',$2,'2026-10-28',$3)",[card,a,paymentKey]);assert.equal((await db.query('select * from public.statement_payments')).rows.length,1);
+ assert.equal((await db.query('select * from public.financial_transactions where card_id=$1',[card])).rows.length,3);
+ await assert.rejects(db.query("select public.pay_statement($1,'2026-10-01',$2,'2026-10-28',$3)",[card,a,crypto.randomUUID()]));
+ await assert.rejects(db.query("select public.record_card_purchase($1,'Compra tardia',5000,1,'2026-10-10','Compras',$2)",[card,crypto.randomUUID()]));
+ assert.ok((await db.query('select * from public.audit_logs')).rows.length>=6);
+ await assert.rejects(db.query('delete from public.audit_logs'));
+ for(let i=0;i<6;i++)assert.ok((await db.query('select public.reserve_ai_request() as id')).rows[0].id);
+ assert.equal((await db.query('select public.reserve_ai_request() as id')).rows[0].id,null);
+ await db.exec('reset role');const policies=(await db.query("select tablename from pg_tables where schemaname='public' and not rowsecurity")).rows;assert.equal(policies.length,0);
+ await db.query('delete from auth.users where id=$1',[A]);assert.equal((await db.query('select * from public.financial_transactions where user_id=$1',[A])).rows.length,0);assert.equal((await db.query('select * from public.audit_logs where user_id=$1',[A])).rows.length,0);
+ }finally{await db.close();}});
+test('payment lifecycle, duplicate webhook, expiry, WhatsApp identity and replay defense',async()=>{const db=await database();try{
+ const checkout=crypto.randomUUID(),paid=new Date().toISOString();
+ await db.exec("update public.subscription_plans set enabled=true,price_cents=2990,product_id='product-pro',offer_id='offer-pro' where id='pro'");
+ await db.query("insert into public.checkout_sessions(id,user_id,plan_id) values($1,$2,'pro')",[checkout,A]);
+ const apply=async(key,event,order='order1',date=paid)=>db.query("select public.apply_cakto_event($1,$2,$3,$4,'product-pro','offer-pro','sub1','paid',2990,'BRL',$5)",[key,event,order,checkout,date]);
+ await apply('order1:approved','purchase_approved');await apply('order1:approved','purchase_approved');assert.equal((await db.query('select * from public.payment_events')).rows.length,1);
+ assert.equal((await db.query('select status from public.subscriptions')).rows[0].status,'active');
+ await db.query("insert into public.whatsapp_link_tokens(user_id,token_hash,expires_at) values($1,'hash-proof',now()+interval '10 minutes')",[A]);await db.query("select public.link_whatsapp('hash-proof','5511999999999')");await assert.rejects(db.query("select public.link_whatsapp('hash-proof','5511888888888')"));
+ const draft=crypto.randomUUID();await db.query("insert into public.assistant_drafts(id,user_id,source_message,intent) values($1,$2,'wamid1',$3)",[draft,A,JSON.stringify({description:'Mercado',amount_cents:3500,kind:'expense',category:'Alimentação',date:'2026-10-26'})]);
+ for(let i=0;i<2;i++)await db.query("select public.confirm_whatsapp_draft('5511999999999',$1)",[draft]);assert.equal((await db.query('select * from public.financial_transactions')).rows.length,1);
+ await assert.rejects(db.query("select public.confirm_whatsapp_draft('5511888888888',$1)",[draft]));
+ await apply('order1:refund','refund');assert.equal((await db.query('select status from public.subscriptions')).rows[0].status,'refunded');await assert.rejects(apply('late-approval','purchase_approved'));
+ await db.exec('update private.runtime_settings set billing_required=true');await asUser(db,A);
+ await assert.rejects(db.query("insert into public.savings_goals(user_id,name,target_cents) values($1,'Meta proibida',10000)",[A]));
+ assert.equal((await db.query('select * from public.financial_transactions')).rows.length,1);
+ await assert.rejects(db.query("select public.apply_cakto_event('fake','purchase_approved','x',null,'product-pro','offer-pro','sub1','paid',2990,'BRL',now())"));
+ await assert.rejects(db.query("select public.link_whatsapp('hash-proof','5511999999999')"));
+ await db.exec('reset role');await db.exec("update public.subscriptions set status='active',current_period_end=now()-interval '1 second'");await asUser(db,A);assert.equal((await db.query('select private.can_write_finance() as allowed')).rows[0].allowed,false);
+ }finally{await db.close();}});

@@ -1,0 +1,2 @@
+import {defineConfig,devices} from '@playwright/test';
+export default defineConfig({testDir:'./tests/e2e',timeout:45000,workers:1,use:{baseURL:'http://127.0.0.1:3000',trace:'retain-on-failure',launchOptions:{executablePath:process.env.PLAYWRIGHT_BROWSER_PATH||'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'}},projects:[{name:'desktop',use:{viewport:{width:1440,height:1080}}},{name:'mobile',use:{...devices['iPhone 13'],defaultBrowserType:'chromium'}}],reporter:'list'});

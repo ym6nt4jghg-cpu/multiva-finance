@@ -1,0 +1,9 @@
+import {z} from 'zod';
+// Store only integration identifiers and state. Never persist webhook secret, CPF, address or card data.
+const order=z.object({id:z.string().min(1).max(100),status:z.string().max(50),currency:z.string().length(3),amount:z.number().nonnegative().nullable(),callback:z.string().max(100).nullable().optional(),product:z.object({id:z.string().max(100)}),offer:z.object({id:z.string().max(100)}),paidAt:z.string().nullable().optional(),refundedAt:z.string().nullable().optional(),chargedbackAt:z.string().nullable().optional(),subscription:z.record(z.string(),z.unknown()).nullable().optional()});
+export const billingEvents=['purchase_approved','purchase_refused','refund','chargeback','subscription_created','subscription_renewed','subscription_renewal_refused','subscription_paused','subscription_resumed','subscription_late','subscription_late_recovered','subscription_canceled'];
+export function parseCakto(input:unknown){const p=z.object({event:z.string(),data:z.unknown()}).parse(input);if(!billingEvents.includes(p.event))return [];
+ return (Array.isArray(p.data)?p.data:[p.data]).map(raw=>{const o=order.parse(raw);const amount=o.amount===null?0:Math.round(o.amount*100);if(!Number.isSafeInteger(amount)||Math.abs(amount/100-(o.amount||0))>0.00001)throw new Error('Invalid amount');
+ // Subscription payload is intentionally not trusted for entitlement until reconciled against the provider API.
+ return {external_id:`${o.id}:${p.event}`,payload:{event:p.event,order_id:o.id,status:o.status,currency:o.currency,amount_cents:amount,callback:o.callback||null,product_id:o.product.id,offer_id:o.offer.id,paid_at:o.paidAt||null,refunded_at:o.refundedAt||null,charged_back_at:o.chargedbackAt||null,subscription_id:typeof o.subscription?.id==='string'?o.subscription.id:null}};
+ });}

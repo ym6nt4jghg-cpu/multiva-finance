@@ -1,0 +1,2 @@
+import {NextResponse} from 'next/server';import {supabase} from '@/lib/supabase/server';
+export async function GET(req:Request){const u=new URL(req.url),code=u.searchParams.get('code'),base=process.env.APP_URL||u.origin;const next=u.searchParams.get('next')==='/redefinir'?'/redefinir':'/painel';if(code){try{const db=await supabase();const {error}=await db.auth.exchangeCodeForSession(code);if(!error)return NextResponse.redirect(new URL(next,base));}catch{}}return NextResponse.redirect(new URL('/entrar?erro=link-expirado',base));}

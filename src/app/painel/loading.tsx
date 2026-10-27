@@ -1,0 +1,1 @@
+export default function Loading(){return <main id="main" className="loading-page" aria-busy="true"><div className="skeleton"/><h2>Organizando sua visão financeira…</h2><p>Carregando seus registros com segurança.</p></main>}
