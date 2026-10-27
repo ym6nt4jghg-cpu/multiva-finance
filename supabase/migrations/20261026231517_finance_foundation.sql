@@ -82,7 +82,7 @@ create table public.subscription_plans (
  created_at timestamptz not null default now()
 );
 insert into public.subscription_plans(id,name) values('start','Start'),('pro','Pro'),('premium','Premium');
-create table public.subscriptions (
+create table public.finance_subscriptions (
  user_id uuid primary key references auth.users(id) on delete cascade,plan_id text not null references public.subscription_plans(id),
  provider_subscription_id text unique,status text not null check(status in ('pending','active','past_due','canceled','refunded','chargeback','paused')),
  current_period_end timestamptz,last_event_at timestamptz,last_order_id text,created_at timestamptz not null default now()
@@ -134,7 +134,7 @@ alter table private.admin_users enable row level security;
 
 -- Default deny for every exposed table. Explicit grants accompany explicit ownership policies.
 do $$ declare t text;begin
- for t in select tablename from pg_tables where schemaname='public' loop
+ for t in select unnest(array['profiles','financial_accounts','transaction_categories','credit_cards','financial_transactions','savings_goals','budgets','recurring_transactions','account_transfers','statement_payments','subscription_plans','finance_subscriptions','checkout_sessions','whatsapp_identities','whatsapp_link_tokens','webhook_jobs','payment_events','ai_usage','audit_logs','support_requests']) loop
  execute format('alter table public.%I enable row level security',t);
  execute format('revoke all on public.%I from anon, authenticated',t);
  end loop;
@@ -143,7 +143,7 @@ do $$ declare t text;begin
  execute format('create policy own_rows on public.%I for all to authenticated using ((select auth.uid())=user_id) with check ((select auth.uid())=user_id)',t);
  execute format('create index %I on public.%I(user_id)',t||'_owner',t);
  end loop;
- for t in select unnest(array['credit_cards','financial_transactions','account_transfers','statement_payments','subscriptions','checkout_sessions','whatsapp_identities','ai_usage','audit_logs','support_requests']) loop
+ for t in select unnest(array['credit_cards','financial_transactions','account_transfers','statement_payments','finance_subscriptions','checkout_sessions','whatsapp_identities','ai_usage','audit_logs','support_requests']) loop
  execute format('grant select on public.%I to authenticated',t);
  execute format('create policy read_own on public.%I for select to authenticated using ((select auth.uid())=user_id)',t);
  end loop;
@@ -268,7 +268,7 @@ grant execute on function public.claim_webhook_job() to service_role;
 create function private.admin_metrics() returns jsonb language plpgsql security definer set search_path='' as $$
 begin
  if auth.uid() is null or not exists(select 1 from private.admin_users where user_id=auth.uid()) then raise exception 'Forbidden';end if;
- return jsonb_build_object('users',(select count(*) from public.profiles),'active_subscriptions',(select count(*) from public.subscriptions where status='active' and current_period_end>now()),'pending_jobs',(select count(*) from public.webhook_jobs where status in ('pending','processing')),'failed_jobs',(select count(*) from public.webhook_jobs where status='failed'),'ai_requests',(select count(*) from public.ai_usage),'input_tokens',(select coalesce(sum(input_tokens),0) from public.ai_usage),'output_tokens',(select coalesce(sum(output_tokens),0) from public.ai_usage),'open_support',(select count(*) from public.support_requests where status='open'));
+ return jsonb_build_object('users',(select count(*) from public.profiles),'active_subscriptions',(select count(*) from public.finance_subscriptions where status='active' and current_period_end>now()),'pending_jobs',(select count(*) from public.webhook_jobs where status in ('pending','processing')),'failed_jobs',(select count(*) from public.webhook_jobs where status='failed'),'ai_requests',(select count(*) from public.ai_usage),'input_tokens',(select coalesce(sum(input_tokens),0) from public.ai_usage),'output_tokens',(select coalesce(sum(output_tokens),0) from public.ai_usage),'open_support',(select count(*) from public.support_requests where status='open'));
 end $$;
 create function public.admin_metrics() returns jsonb language sql security invoker set search_path='' as $$select private.admin_metrics()$$;
 revoke all on function private.admin_metrics(),public.admin_metrics() from public,anon;
@@ -292,7 +292,7 @@ create function public.link_whatsapp(p_hash text,p_phone text) returns uuid lang
 declare u uuid;begin
  select user_id into u from public.whatsapp_link_tokens where token_hash=p_hash and expires_at>now() for update;
  if u is null then raise exception 'Link expired';end if;
- if not exists(select 1 from public.subscriptions where user_id=u and status='active' and current_period_end>now()) then raise exception 'Subscription required';end if;
+ if not exists(select 1 from public.finance_subscriptions where user_id=u and status='active' and current_period_end>now()) then raise exception 'Subscription required';end if;
  insert into public.whatsapp_identities(user_id,phone,last_inbound_at) values(u,p_phone,now())
  on conflict(user_id) do update set phone=excluded.phone,verified_at=now(),last_inbound_at=now(),notifications=false;
  delete from public.whatsapp_link_tokens where user_id=u;return u;
@@ -303,7 +303,7 @@ grant execute on function public.link_whatsapp(text,text) to service_role;
 create function public.confirm_whatsapp_draft(p_phone text,p_draft uuid) returns uuid language plpgsql security invoker set search_path='' as $$
 declare u uuid;d public.assistant_drafts;r uuid;a uuid;begin
  select user_id into u from public.whatsapp_identities where phone=p_phone;
- if u is null or not exists(select 1 from public.subscriptions where user_id=u and status='active' and current_period_end>now()) then raise exception 'Unauthorized';end if;
+ if u is null or not exists(select 1 from public.finance_subscriptions where user_id=u and status='active' and current_period_end>now()) then raise exception 'Unauthorized';end if;
  select * into d from public.assistant_drafts where id=p_draft and user_id=u for update;
  if not found then raise exception 'Unknown draft';end if;
  if d.transaction_id is not null then return d.transaction_id;end if;
@@ -317,30 +317,30 @@ revoke all on function public.confirm_whatsapp_draft(text,uuid) from public,anon
 grant execute on function public.confirm_whatsapp_draft(text,uuid) to service_role;
 
 create function public.apply_cakto_event(p_external_id text,p_event text,p_order text,p_callback uuid,p_product text,p_offer text,p_subscription text,p_status text,p_amount bigint,p_currency text,p_paid_at timestamptz) returns text language plpgsql security invoker set search_path='' as $$
-declare plan public.subscription_plans;u uuid;existing public.subscriptions;begin
+declare plan public.subscription_plans;u uuid;existing public.finance_subscriptions;begin
  -- This function is reachable only with service credentials. Never map by email or browser-supplied user ID.
  select * into plan from public.subscription_plans where product_id=p_product and offer_id=p_offer and enabled for share;
  if not found then raise exception 'Unknown product or disabled plan';end if;
  select user_id into u from public.checkout_sessions where id=p_callback and plan_id=plan.id;
- if u is null and p_subscription is not null then select user_id into u from public.subscriptions where provider_subscription_id=p_subscription;end if;
+ if u is null and p_subscription is not null then select user_id into u from public.finance_subscriptions where provider_subscription_id=p_subscription;end if;
  if u is null then raise exception 'Unmapped payment';end if;
  perform pg_advisory_xact_lock(hashtextextended(u::text,1));
  if exists(select 1 from public.payment_events where external_id=p_external_id) then return 'duplicate';end if;
- select * into existing from public.subscriptions where user_id=u for update;
+ select * into existing from public.finance_subscriptions where user_id=u for update;
  if p_event in ('purchase_approved','subscription_renewed','subscription_late_recovered') then
   if p_status<>'paid' or p_currency<>'BRL' or p_amount<>plan.price_cents or p_paid_at is null or p_paid_at>now()+interval '5 minutes' then raise exception 'Unconfirmed payment';end if;
   if existing.status in ('canceled','refunded','chargeback','paused') then raise exception 'Manual provider reconciliation required before reactivation';end if;
   if existing.last_event_at is null or p_paid_at>existing.last_event_at then
-   insert into public.subscriptions(user_id,plan_id,provider_subscription_id,status,current_period_end,last_event_at,last_order_id)
+   insert into public.finance_subscriptions(user_id,plan_id,provider_subscription_id,status,current_period_end,last_event_at,last_order_id)
    values(u,plan.id,p_subscription,'active',p_paid_at+make_interval(days=>plan.period_days),p_paid_at,p_order)
-   on conflict(user_id) do update set plan_id=excluded.plan_id,provider_subscription_id=coalesce(excluded.provider_subscription_id,public.subscriptions.provider_subscription_id),status='active',current_period_end=excluded.current_period_end,last_event_at=excluded.last_event_at,last_order_id=excluded.last_order_id;
+   on conflict(user_id) do update set plan_id=excluded.plan_id,provider_subscription_id=coalesce(excluded.provider_subscription_id,public.finance_subscriptions.provider_subscription_id),status='active',current_period_end=excluded.current_period_end,last_event_at=excluded.last_event_at,last_order_id=excluded.last_order_id;
   end if;
  elsif p_event in ('refund','chargeback','subscription_canceled','subscription_paused') then
-  insert into public.subscriptions(user_id,plan_id,provider_subscription_id,status,last_order_id)
+  insert into public.finance_subscriptions(user_id,plan_id,provider_subscription_id,status,last_order_id)
   values(u,plan.id,p_subscription,case p_event when 'refund' then 'refunded' when 'chargeback' then 'chargeback' when 'subscription_paused' then 'paused' else 'canceled' end,p_order)
   on conflict(user_id) do update set status=excluded.status;
  elsif p_event in ('subscription_late','subscription_renewal_refused') then
-  update public.subscriptions set status='past_due' where user_id=u and status='active' and current_period_end<=now();
+  update public.finance_subscriptions set status='past_due' where user_id=u and status='active' and current_period_end<=now();
  elsif p_event='subscription_resumed' then raise exception 'Provider reconciliation required';
  end if;
  insert into public.payment_events(external_id,event,order_id,user_id,amount_cents,currency) values(p_external_id,p_event,p_order,u,p_amount,p_currency);
@@ -378,7 +378,7 @@ create table private.runtime_settings(id boolean primary key default true check(
 insert into private.runtime_settings default values;
 alter table private.runtime_settings enable row level security;
 create function private.can_write_finance() returns boolean language sql stable security definer set search_path='' as $$
- select auth.uid() is not null and (not (select billing_required from private.runtime_settings where id) or exists(select 1 from public.subscriptions where user_id=auth.uid() and status='active' and current_period_end>now()));
+ select auth.uid() is not null and (not (select billing_required from private.runtime_settings where id) or exists(select 1 from public.finance_subscriptions where user_id=auth.uid() and status='active' and current_period_end>now()));
 $$;
 revoke all on function private.can_write_finance() from public,anon;
 grant execute on function private.can_write_finance() to authenticated;

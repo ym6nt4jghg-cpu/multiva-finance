@@ -105,6 +105,11 @@ body{background:radial-gradient(circle at 12% 0,rgba(47,124,255,.07),transparent
 
 /* Landing hero layout correction — fold-safe from 1366×768 upward */
 .landing{width:100%;max-width:100%;overflow-x:clip}
+.landing .feature-strip,.landing .section,.landing .site-footer{box-sizing:border-box;width:100%;max-width:none;margin-inline:0}
+.landing .feature-strip{padding-inline:clamp(24px,7vw,110px)}
+.landing .section{padding-inline:clamp(24px,7vw,110px)}
+.landing .site-footer{padding-inline:clamp(24px,7vw,110px)}
+.landing .how-section .section-title,.landing .resources-section .section-title,.landing .plans-section .section-title{margin-inline:auto}
 .landing .site-nav{width:100%;max-width:none;height:76px;margin:0;padding-inline:clamp(24px,5vw,80px)}
 .landing .site-nav nav{gap:clamp(22px,2.2vw,34px)}
 .landing .site-nav nav a,.landing .nav-login{font-size:13px;white-space:nowrap}
